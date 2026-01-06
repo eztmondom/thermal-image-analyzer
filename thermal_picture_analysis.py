@@ -6,6 +6,36 @@ import matplotlib.pyplot as plt
 # Helpers
 # ----------------------------
 
+def draw_hud(img, lines, origin=(6, 6), font=cv2.FONT_HERSHEY_SIMPLEX,
+             font_scale=0.45, thickness=1, pad=6, bg_alpha=0.55):
+    """
+    Draw a small readable HUD box with multiple text lines.
+    Uses semi-transparent dark background for contrast.
+    """
+    x0, y0 = origin
+    # measure text block
+    sizes = [cv2.getTextSize(t, font, font_scale, thickness)[0] for t in lines]
+    w = max(s[0] for s in sizes) + pad * 2
+    h_line = max(s[1] for s in sizes)
+    h = (h_line + 4) * len(lines) + pad * 2
+
+    # background overlay
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + w, y0 + h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, bg_alpha, img, 1 - bg_alpha, 0, img)
+
+    # text lines
+    y = y0 + pad + h_line
+    for t in lines:
+        cv2.putText(img, t, (x0 + pad, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        y += (h_line + 4)
+
+def scale_for_display(img, scale=3, interpolation=cv2.INTER_NEAREST):
+    """Scale only for display, keeps pixel mapping intact."""
+    if scale == 1:
+        return img
+    return cv2.resize(img, (img.shape[1] * scale, img.shape[0] * scale), interpolation=interpolation)
+
 def debug_scale_sampling(img_bgr, roi, sample_x=None, samples=256, out_prefix="debug"):
     x, y, w, h = roi
     scale = img_bgr[y:y+h, x:x+w].copy()
@@ -194,6 +224,15 @@ def estimate_temp_projected(bgr, scale_lab, scale_s, scale_t):
 # ----------------------------
 
 def main():
+
+    DISPLAY_SCALE = 3  # 2 vagy 3 ajánlott 320x240-hez
+    HUD_FONT = cv2.FONT_HERSHEY_SIMPLEX
+    HUD_SCALE = 0.3  # betűméret (kicsi)
+    HUD_THICK = 1  # vékony
+    HUD_PAD = 6  # belső margó
+    HUD_BG_ALPHA = 0.55  # félig átlátszó háttér
+
+
     print("Thermal cursor estimator (PNG/JPG + scale).")
     #path = input("Add meg a képfájl útvonalát (pl. C:\\kepek\\hokep.png): ").strip().strip('"')
     path = "c:\A\IMG_0045.bmp"
@@ -238,16 +277,19 @@ def main():
     pinned_points = []  # list of (x,y,temp)
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal display, last_xy, pinned_points
+        nonlocal last_xy, pinned_points
+        # map display coords -> original coords
+        ox = int(x / DISPLAY_SCALE)
+        oy = int(y / DISPLAY_SCALE)
+
         if event == cv2.EVENT_MOUSEMOVE:
-            last_xy = (x, y)
+            last_xy = (ox, oy)
         elif event == cv2.EVENT_LBUTTONDOWN:
-            # pin point
-            bgr = img[y, x].tolist()
-            temp, d2 = estimate_temp_projected(bgr, scale_lab, scale_s, scale_t)
-            pinned_points.append((x, y, temp))
+            if 0 <= ox < img.shape[1] and 0 <= oy < img.shape[0]:
+                bgr = img[oy, ox].tolist()
+                temp, d2 = estimate_temp_projected(bgr, scale_lab, scale_s, scale_t)
+                pinned_points.append((ox, oy, temp))
         elif event == cv2.EVENT_RBUTTONDOWN:
-            # clear pins
             pinned_points = []
 
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -264,17 +306,6 @@ def main():
         cv2.putText(display, "SCALE ROI", (sx, max(20, sy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         # show current cursor temp
-        if last_xy is not None:
-            x, y = last_xy
-            if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
-                bgr = img[y, x].tolist()
-                temp, d2 = estimate_temp_projected(bgr, scale_lab, scale_s, scale_t)
-
-                text = f"({x},{y}, {bgr})\n  ~ {temp:.2f} C"
-                cv2.circle(display, (x, y), 1, (255, 255, 255), -1)
-                cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 4)
-                cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 2)
-
         # draw pinned points
         for (px, py, pt) in pinned_points:
             cv2.circle(display, (px, py), 1, (0, 0, 0), -1)
@@ -282,7 +313,30 @@ def main():
             cv2.putText(display, f"{pt:.2f}C", (px + 8, py - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
             cv2.putText(display, f"{pt:.2f}C", (px + 8, py - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-        cv2.imshow(win, display)
+        # cv2.imshow(win, display)
+        lines = []
+        if last_xy is not None:
+            x, y = last_xy
+            if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+                bgr = img[y, x].tolist()
+                temp, d2 = estimate_temp_projected(bgr, scale_lab, scale_s, scale_t)
+                lines.append(f"XY: {x},{y}")
+                lines.append(f"T:  {temp:.2f} C")
+
+        if len(pinned_points) > 0:
+            lines.append(f"Pins: {len(pinned_points)} (RMB clear)")
+
+        if not lines:
+            lines = ["Move mouse to read temperature", "LMB pin, RMB clear, ESC quit"]
+
+        draw_hud(display, lines, origin=(6, 6),
+                 font=HUD_FONT, font_scale=HUD_SCALE, thickness=HUD_THICK,
+                 pad=HUD_PAD, bg_alpha=HUD_BG_ALPHA)
+
+        # finally show scaled-up view
+        view = scale_for_display(display, scale=DISPLAY_SCALE, interpolation=cv2.INTER_NEAREST)
+        cv2.imshow(win, view)
+
         key = cv2.waitKey(15) & 0xFF
         if key == 27:  # ESC
             break

@@ -1,10 +1,235 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 # ----------------------------
 # Helpers
 # ----------------------------
+
+def normalize_glyph(bw, size=(32, 32), pad=3):
+    """
+    bw: 0/255 bináris kép egyetlen karakterrel
+    - szoros vágás a tartalomra
+    - padding
+    - fix méretre húzás
+    """
+
+    # biztosítsuk: a "tinta" fehér legyen
+    if bw.mean() > 127:
+        bw = cv2.bitwise_not(bw)
+
+    ys, xs = np.where(bw > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return cv2.resize(bw, size, interpolation=cv2.INTER_NEAREST)
+
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+    glyph = bw[y0:y1+1, x0:x1+1]
+
+    glyph = cv2.copyMakeBorder(glyph, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    glyph = cv2.resize(glyph, size, interpolation=cv2.INTER_NEAREST)
+    return glyph
+
+# --- FIX ROIs for 320x240 (IDE írd be a saját számaidat!) ---
+SCALE_ROI = (222, 54, 15, 200)
+TMAX_ROI = (200, 35, 40, 20)
+TMIN_ROI = (200, 257, 40, 20)
+TOP_IS_HOT = True  # nálad tipikusan True (felül melegebb)
+
+def draw_rois_debug(img_bgr):
+    """
+    Draw fixed ROIs on the image for visual verification.
+    """
+    out = img_bgr.copy()
+
+    rois = [
+        (SCALE_ROI, "SCALE"),
+        (TMAX_ROI,  "TMAX"),
+        (TMIN_ROI,  "TMIN"),
+    ]
+
+    for (x, y, w, h), name in rois:
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 1)
+        cv2.putText(
+            out,
+            name,
+            (x, max(10, y - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (0, 255, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return out
+
+def preprocess_digit_crop(bgr, name="defname"):
+    import cv2
+    import numpy as np
+
+    # 1) upscale (OCR-nek és szegmentálásnak sokat számít)
+    img = cv2.resize(bgr, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC)
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    H, S, V = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+
+    # 2) fehér számok maszkja (alacsony sat, magas value)
+    mask_white = ((S < 60) & (V > 160)).astype(np.uint8) * 255
+
+    # 3) zöld számok/keretek maszkja (ha előfordul)
+    # zöld hue kb. 35..95 (OpenCV H: 0..179)
+    mask_green = ((H >= 35) & (H <= 95) & (S > 80) & (V > 80)).astype(np.uint8) * 255
+
+    bw = cv2.bitwise_or(mask_white, mask_green)
+
+    # 4) tisztítás
+    bw = cv2.medianBlur(bw, 3)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=2)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN,  np.ones((2,2), np.uint8), iterations=1)
+
+    # 5) komponens-szűrés: dobd ki a kis pöttyöket, de a "."-ot hagyd meg
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    Hh, Ww = bw.shape[:2]
+    out = np.zeros_like(bw)
+
+    # heurisztikák:
+    area_min = int((Hh * Ww) * 0.002)   # általános zajküszöb
+    dot_area_min = int((Hh * Ww) * 0.0003)
+
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        cx, cy = centroids[i]
+
+        # fő karakterek (számjegyek)
+        is_main = (area >= area_min) and (h >= Hh * 0.30)
+
+        # pont (kicsi, lent)
+        is_dot = (area >= dot_area_min) and (h <= Hh * 0.25) and (cy >= Hh * 0.45)
+
+        # mínusz (lapos, széles komponens)
+        # - kicsi magasság
+        # - relatíve széles
+        # - középtáj / bal oldali régióban szokott lenni
+        is_minus = (
+                (area >= dot_area_min) and
+                (h <= Hh * 0.22) and
+                (w >= Ww * 0.07)
+        )
+
+        if is_main or is_dot or is_minus:
+            out[labels == i] = 255
+
+    out_dir="preprocess_digit_crop"
+    os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(out_dir,f"{name}_dbg_crop.png"), bgr)
+    cv2.imwrite(os.path.join(out_dir,f"{name}_dbg_bw.png"), out)  # ahol out a végső bináris
+    cv2.imwrite(os.path.join(out_dir,f"{name}_dbg_mask_white.png"), mask_white)
+    cv2.imwrite(os.path.join(out_dir,f"{name}_dbg_mask_green.png"), mask_green)
+    cv2.imwrite(os.path.join(out_dir,f"{name}_dbg_bw_raw.png"), bw)
+    return out
+
+def split_chars(bw):
+    if bw is None:
+        return []
+
+    cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = bw.shape
+    boxes = []
+
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+
+        area = w * h
+        if area < 8:  # nagyon pici zaj
+            continue
+
+        aspect = w / float(h + 1e-6)
+
+        # számjegy: elég magas
+        is_digit = (h >= H * 0.35) and (w >= 5)
+
+        # pont: kicsi és lentebb
+        is_dot = (h <= H * 0.28) and (w <= W * 0.18) and (y >= H * 0.40)
+
+        # mínusz: nagyon lapos és szélesebb, mint egy zaj pötty
+        # (a te képednél a mínusz rövidebb, ezért W*0.06 körül már engedjük)
+        is_minus = (h <= H * 0.20) and (w >= W * 0.06) and (aspect >= 2.2)
+
+        if is_digit or is_dot or is_minus:
+            boxes.append((x, y, w, h))
+
+    boxes.sort(key=lambda b: b[0])
+    return boxes
+
+def load_templates(folder="templates"):
+    mapping = {"minus.png": "-", "dot.png": "."}
+    tmpls = {}
+    if not os.path.isdir(folder):
+        return tmpls
+
+    for fn in os.listdir(folder):
+        path = os.path.join(folder, fn)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        _, bw = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if bw.mean() > 180:
+            bw = cv2.bitwise_not(bw)
+
+        key = mapping.get(fn)
+        if key is None:
+            name = os.path.splitext(fn)[0]
+            if name.isdigit():
+                key = name
+        if key is not None:
+            bw = normalize_glyph(bw, size=(32, 32))
+            tmpls[key] = bw
+
+    for k, v in tmpls.items():
+        print("tmpl", k, v.shape, "mean", v.mean())
+
+    cv2.imwrite("dbg_tmpl_minus.png", tmpls["-"])
+    cv2.imwrite("dbg_tmpl_dot.png", tmpls["."])
+    cv2.imwrite("dbg_tmpl_8.png", tmpls["8"])
+
+    return tmpls
+
+def read_number_from_roi(bgr_roi, templates, min_score=0.60):
+    bw = preprocess_digit_crop(bgr_roi)
+    boxes = split_chars(bw)
+    if not boxes:
+        return None
+
+    os.makedirs("read_number_from_roi", exist_ok=True)
+    out_dir="read_number_from_roi"
+    out = []
+    debug_i=0
+    for x, y, w, h in boxes:
+        debug_i=debug_i+1
+        ch = bw[y:y+h, x:x+w]
+        ch = cv2.copyMakeBorder(ch, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
+        ch = normalize_glyph(ch, size=(32, 32))
+        cv2.imwrite(os.path.join(out_dir, f"{debug_i}_{y}_dbg_char_norm.png"), ch)
+
+        best_char, best_score = None, -1
+        for k, tmpl in templates.items():
+            resized = cv2.resize(ch, (tmpl.shape[1], tmpl.shape[0]), interpolation=cv2.INTER_NEAREST)
+            diff = cv2.absdiff(resized, tmpl)
+            score = 1.0 - diff.mean() / 255.0
+            if score > best_score:
+                best_score = score
+                best_char = k
+                print(f"DBG char: best={best_char} score={best_score:.3f}")
+
+        if best_char is None or best_score < min_score:
+            return None
+        out.append(best_char)
+
+    try:
+        return float("".join(out))
+    except ValueError:
+        return None
 
 def draw_hud(img, lines, origin=(6, 6), font=cv2.FONT_HERSHEY_SIMPLEX,
              font_scale=0.45, thickness=1, pad=6, bg_alpha=0.55):
@@ -235,39 +460,75 @@ def main():
 
     print("Thermal cursor estimator (PNG/JPG + scale).")
     #path = input("Add meg a képfájl útvonalát (pl. C:\\kepek\\hokep.png): ").strip().strip('"')
-    path = "c:\A\IMG_0045.bmp"
+    path = r"c:\A\IMG_0045.bmp"
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         print("Nem tudtam beolvasni a képet. Ellenőrizd az útvonalat!")
         return
 
     # 1) Select scale ROI
-    print("\n1) Jelöld ki a SZÍNSKÁLA téglalapját (egérrel), majd ENTER. ESC = kilép.")
-    roi = cv2.selectROI("Select SCALE ROI", img, showCrosshair=True, fromCenter=False)
-    cv2.destroyWindow("Select SCALE ROI")
+    # print("\n1) Jelöld ki a SZÍNSKÁLA téglalapját (egérrel), majd ENTER. ESC = kilép.")
+    # roi = cv2.selectROI("Select SCALE ROI", img, showCrosshair=True, fromCenter=False)
+    # cv2.destroyWindow("Select SCALE ROI")
+    #
+    # if roi == (0, 0, 0, 0):
+    #     print("ROI nincs kijelölve, kilépek.")
+    #     return
+    #
+    # # 2) Tmin / Tmax
+    # while True:
+    #     try:
+    #         t_min = float(input("2) Tmin (a skála legalja / legalacsonyabb érték, °C): ").replace(",", "."))
+    #         t_max = float(input("   Tmax (a skála teteje / legmagasabb érték, °C): ").replace(",", "."))
+    #         break
+    #     except ValueError:
+    #         print("Kérlek számot adj meg (pl. 18.5).")
+    #
+    # # 3) Orientation info
+    # ans = input("3) A skála TETEJE a melegebb (hot)? [y/n] (ha vízszintes skála: BAL oldala hot): ").strip().lower()
+    # top_is_hot = (ans != "n")
 
-    if roi == (0, 0, 0, 0):
-        print("ROI nincs kijelölve, kilépek.")
-        return
+    def crop_roi(img, roi):
+        x, y, w, h = roi
+        return img[y:y + h, x:x + w].copy()
 
-    # 2) Tmin / Tmax
-    while True:
-        try:
-            t_min = float(input("2) Tmin (a skála legalja / legalacsonyabb érték, °C): ").replace(",", "."))
-            t_max = float(input("   Tmax (a skála teteje / legmagasabb érték, °C): ").replace(",", "."))
-            break
-        except ValueError:
-            print("Kérlek számot adj meg (pl. 18.5).")
+    # 1) FIX ROI használata
+    roi = SCALE_ROI
+    top_is_hot = TOP_IS_HOT
 
-    # 3) Orientation info
-    ans = input("3) A skála TETEJE a melegebb (hot)? [y/n] (ha vízszintes skála: BAL oldala hot): ").strip().lower()
-    top_is_hot = (ans != "n")
+    # 2) Template-ek betöltése
+    templates = load_templates("templates")
+    print("TEMPLATE KEYS:", sorted(templates.keys()))
+    print("TEMPLATE COUNT:", len(templates))
+    if not templates:
+        print("Nincs templates mappa vagy üres. Kézzel kell Tmin/Tmax.")
+        t_min = float(input("Tmin (°C): ").replace(",", "."))
+        t_max = float(input("Tmax (°C): ").replace(",", "."))
+    else:
+        print("=== TMAX ===")
+        t_max = read_number_from_roi(crop_roi(img, TMAX_ROI), templates, min_score=0.40)
+        print("=== TMIN ===")
+        t_min = read_number_from_roi(crop_roi(img, TMIN_ROI), templates, min_score=0.40)
+
+        dump_ocr_debug(img, TMAX_ROI, templates, name="TMAX")
+        dump_ocr_debug(img, TMIN_ROI, templates, name="TMIN")
+        print("Debug képek mentve: ./ocr_debug mappába")
+
+        if t_min is None or t_max is None:
+            print("Template OCR nem sikerült biztosan. Fallback kézi beírás.")
+            #t_min = float(input("Tmin (°C): ").replace(",", "."))
+            t_min=float("-4.8")
+            #t_max = float(input("Tmax (°C): ").replace(",", "."))
+            t_max=float("2.8")
+
+        else:
+            print(f"Auto Tmin/Tmax: Tmin={t_min}, Tmax={t_max}")
 
     # Build LUT
     lut_colors, lut_temps = build_lut_from_scale(img, roi, t_min, t_max, top_is_hot=top_is_hot, samples=256)
     print(f"LUT elkészült: {len(lut_temps)} mintapont a skáláról.")
     scale_lab, scale_s, scale_t = build_parametric_scale(lut_colors, lut_temps)
-    debug_scale_sampling(img, roi, out_prefix="scalecheck")
+    # debug_scale_sampling(img, roi, out_prefix="scalecheck")
 
     # Interactive window
     win = "Thermal Cursor (ESC=quit)"
@@ -292,18 +553,23 @@ def main():
         elif event == cv2.EVENT_RBUTTONDOWN:
             pinned_points = []
 
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(win, on_mouse)
+    #cv2.namedWindow(win, cv2.WINDOW_NORMAL) #vissza
+    #cv2.setMouseCallback(win, on_mouse)
 
     print("\nKezdheted: mozgasd a kurzort a képen. Bal klikk = pont rögzítése, jobb klikk = pontok törlése, ESC = kilép.\n")
+
+    # dbg = draw_rois_debug(img)
+    # cv2.imshow("ROI check", dbg)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
 
     while True:
         display = img.copy()
 
         # draw selected ROI for scale
-        sx, sy, sw, sh = roi
-        cv2.rectangle(display, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
-        cv2.putText(display, "SCALE ROI", (sx, max(20, sy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        # sx, sy, sw, sh = roi
+        # cv2.rectangle(display, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
+        # cv2.putText(display, "SCALE ROI", (sx, max(20, sy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         # show current cursor temp
         # draw pinned points
@@ -334,15 +600,63 @@ def main():
                  pad=HUD_PAD, bg_alpha=HUD_BG_ALPHA)
 
         # finally show scaled-up view
-        view = scale_for_display(display, scale=DISPLAY_SCALE, interpolation=cv2.INTER_NEAREST)
-        cv2.imshow(win, view)
+        # view = scale_for_display(display, scale=DISPLAY_SCALE, interpolation=cv2.INTER_NEAREST)
+        # cv2.imshow(win, view)
 
+        break
         key = cv2.waitKey(15) & 0xFF
         if key == 27:  # ESC
             break
 
     cv2.destroyAllWindows()
 
+
+def dump_ocr_debug(img_bgr, roi, templates, name="TMAX", out_dir="ocr_debug", min_score=0.60):
+    os.makedirs(out_dir, exist_ok=True)
+
+    x,y,w,h = roi
+    crop = img_bgr[y:y+h, x:x+w].copy()
+    cv2.imwrite(os.path.join(out_dir, f"{name}_crop.png"), crop)
+
+    bw = preprocess_digit_crop(crop, name)
+    cv2.imwrite(os.path.join(out_dir, f"{name}_bw.png"), bw)
+
+    boxes = split_chars(bw)
+
+    # dobozok rajza
+    vis = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    for (bx,by,bw_,bh_) in boxes:
+        cv2.rectangle(vis, (bx,by), (bx+bw_,by+bh_), (0,255,0), 1)
+    cv2.imwrite(os.path.join(out_dir, f"{name}_boxes.png"), vis)
+
+    # karakterenként mentés + score lista
+    lines = []
+    for i,(bx,by,bw_,bh_) in enumerate(boxes):
+        ch = bw[by:by+bh_, bx:bx+bw_]
+        ch = cv2.copyMakeBorder(ch, 2,2,2,2, cv2.BORDER_CONSTANT, value=0)
+        cv2.imwrite(os.path.join(out_dir, f"{name}_char_{i}.png"), ch)
+
+        best_char, best_score = None, -1
+        best2_char, best2_score = None, -1
+
+        for k, tmpl in templates.items():
+            resized = cv2.resize(ch, (tmpl.shape[1], tmpl.shape[0]), interpolation=cv2.INTER_NEAREST)
+            diff = cv2.absdiff(resized, tmpl)
+            score = 1.0 - diff.mean()/255.0
+
+            if score > best_score:
+                best2_char, best2_score = best_char, best_score
+                best_char, best_score = k, score
+            elif score > best2_score:
+                best2_char, best2_score = k, score
+
+        ok = "OK" if best_score >= min_score else "FAIL"
+        lines.append(f"{name} char{i}: best={best_char} {best_score:.3f} ({ok}), 2nd={best2_char} {best2_score:.3f}")
+
+    with open(os.path.join(out_dir, f"{name}_scores.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return boxes
 
 if __name__ == "__main__":
     main()

@@ -244,7 +244,7 @@ def read_number_from_roi(bgr_roi, templates, min_score=0.60):
         if out[0]==".":
                 out[0]="-" # todo: hozzáadandó, hogy a szám közepén ha "-" talál javítsa ki "."-re
         return float("".join(out))
-    except ValueError:
+    except (ValueError, IndexError):
         return None
 
 def draw_hud(img, lines, origin=(6, 6), font=cv2.FONT_HERSHEY_SIMPLEX,

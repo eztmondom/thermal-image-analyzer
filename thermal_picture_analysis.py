@@ -202,12 +202,13 @@ def read_number_from_roi(bgr_roi, templates, min_score=0.60):
         return None
 
     os.makedirs("read_number_from_roi", exist_ok=True)
-    out_dir="read_number_from_roi"
+    out_dir = "read_number_from_roi"
     out = []
-    debug_i=0
+    debug_i = 0
     for x, y, w, h in boxes:
-        debug_i=debug_i+1
-        ch = bw[y:y+h, x:x+w]
+        debug_i = debug_i + 1
+        ch = bw[y:y + h, x:x + w]
+        # Adjunk egy kis paddinget a karakter köré, hogy a szélek ne zavarják a matchinget
         ch = cv2.copyMakeBorder(ch, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
         ch = normalize_glyph(ch, size=(32, 32))
         cv2.imwrite(os.path.join(out_dir, f"{debug_i}_{y}_dbg_char_norm.png"), ch)

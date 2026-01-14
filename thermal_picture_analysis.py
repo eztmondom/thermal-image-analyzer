@@ -186,12 +186,15 @@ def load_templates(folder="templates"):
             bw = normalize_glyph(bw, size=(32, 32))
             tmpls[key] = bw
 
-    for k, v in tmpls.items():
-        print("tmpl", k, v.shape, "mean", v.mean())
+    # for k, v in tmpls.items():
+    #     print("tmpl", k, v.shape, "mean", v.mean())
 
-    cv2.imwrite("dbg_tmpl_minus.png", tmpls["-"])
-    cv2.imwrite("dbg_tmpl_dot.png", tmpls["."])
-    cv2.imwrite("dbg_tmpl_8.png", tmpls["8"])
+    out_dir = "loaded_templates"
+    os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(os.path.join(out_dir,"dbg_tmpl_minus.png"), tmpls["-"])
+    cv2.imwrite(os.path.join(out_dir,"dbg_tmpl_dot.png"), tmpls["."])
+    for i in range(10):
+        cv2.imwrite(os.path.join(out_dir,f"dbg_tmpl_{i}.png"), tmpls[str(i)])
 
     return tmpls
 
@@ -221,13 +224,16 @@ def read_number_from_roi(bgr_roi, templates, min_score=0.60):
             if score > best_score:
                 best_score = score
                 best_char = k
-                print(f"DBG char: best={best_char} score={best_score:.3f}")
+                # print(f"DBG char: best={best_char} score={best_score:.3f}")
 
         if best_char is None or best_score < min_score:
             return None
         out.append(best_char)
 
     try:
+        # print("outtemp:", out)
+        if out[0]==".":
+                out[0]="-" # todo: hozzáadandó, hogy a szám közepén ha "-" talál javítsa ki "."-re
         return float("".join(out))
     except ValueError:
         return None

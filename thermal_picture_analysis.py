@@ -218,16 +218,25 @@ def read_number_from_roi(bgr_roi, templates, min_score=0.60):
 
         best_char, best_score = None, -1
         for k, tmpl in templates.items():
-            resized = cv2.resize(ch, (tmpl.shape[1], tmpl.shape[0]), interpolation=cv2.INTER_NEAREST)
-            diff = cv2.absdiff(resized, tmpl)
-            score = 1.0 - diff.mean() / 255.0
+            # Normált korrelációs együttható használata az egyszerű különbség helyett
+            res = cv2.matchTemplate(ch, tmpl, cv2.TM_CCOEFF_NORMED)
+            _, score, _, _ = cv2.minMaxLoc(res)
+
+
+            # resized = cv2.resize(ch, (tmpl.shape[1], tmpl.shape[0]), interpolation=cv2.INTER_NEAREST)
+            # diff = cv2.absdiff(resized, tmpl)
+            # score = 1.0 - diff.mean() / 255.0
+
+            # print(f"DBG char: ch={ch[1]}, templ={k}, score={score:.3f}")
+
             if score > best_score:
                 best_score = score
                 best_char = k
                 # print(f"DBG char: best={best_char} score={best_score:.3f}")
 
         if best_char is None or best_score < min_score:
-            return None
+            # Ha egy karakter nem biztos, próbáljuk meg a többit, hátha csak egy pont maradt ki
+            continue
         out.append(best_char)
 
     try:

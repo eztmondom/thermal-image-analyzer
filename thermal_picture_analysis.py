@@ -2,6 +2,10 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import threading
+from tkinter import filedialog, messagebox
+import tkinter as tk
+
 
 # ----------------------------
 # Helpers
@@ -460,171 +464,190 @@ def estimate_temp_projected(bgr, scale_lab, scale_s, scale_t):
     return float(temp), float(d2[idx])
 
 
+class AppState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.image_path = None
+        self.img = None
+
+        self.tmin = None
+        self.tmax = None
+        self.top_is_hot = TOP_IS_HOT
+
+        self.need_reload_image = False
+        self.need_rebuild_lut = True
+
+        # LUT cache
+        self.scale_lab = None
+        self.scale_s = None
+        self.scale_t = None
+
+
+
+class ControlPanel(tk.Toplevel):
+    def __init__(self, master, state: AppState, templates):
+        super().__init__(master)
+        self.state = state
+        self.templates = templates
+
+        self.title("Thermal scale control")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+
+        frm = tk.Frame(self, padx=10, pady=10)
+        frm.pack()
+
+        # ---- image path ----
+        tk.Label(frm, text="Image:").grid(row=0, column=0, sticky="e")
+        self.e_path = tk.Entry(frm, width=45)
+        self.e_path.grid(row=0, column=1)
+        tk.Button(frm, text="Browse…", command=self.on_browse).grid(row=0, column=2, padx=6)
+
+        # ---- Tmin / Tmax ----
+        tk.Label(frm, text="Tmin (°C):").grid(row=1, column=0, sticky="e", pady=4)
+        self.e_min = tk.Entry(frm, width=12)
+        self.e_min.grid(row=1, column=1, sticky="w")
+
+        tk.Label(frm, text="Tmax (°C):").grid(row=2, column=0, sticky="e", pady=4)
+        self.e_max = tk.Entry(frm, width=12)
+        self.e_max.grid(row=2, column=1, sticky="w")
+
+        self.var_top_hot = tk.BooleanVar(value=TOP_IS_HOT)
+        tk.Checkbutton(frm, text="Top is hot", variable=self.var_top_hot)\
+            .grid(row=3, column=0, columnspan=3, sticky="w", pady=6)
+
+        btns = tk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=3, sticky="e")
+
+        tk.Button(btns, text="Apply", width=10, command=self.on_apply).pack(side="right")
+        tk.Button(btns, text="Close", width=10, command=self.destroy).pack(side="right", padx=6)
+
+    def on_browse(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.bmp *.png *.jpg *.jpeg"), ("All", "*.*")]
+        )
+        if not path:
+            return
+
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            messagebox.showerror("Error", "Nem sikerült betölteni a képet.")
+            return
+
+        # OCR tipp
+        def crop(img, roi):
+            x,y,w,h = roi
+            return img[y:y+h, x:x+w]
+
+        tmin_guess = read_number_from_roi(crop(img, TMIN_ROI), self.templates, min_score=0.45)
+        tmax_guess = read_number_from_roi(crop(img, TMAX_ROI), self.templates, min_score=0.45)
+
+        self.e_path.delete(0, tk.END)
+        self.e_path.insert(0, path)
+        if tmin_guess is not None:
+            self.e_min.delete(0, tk.END)
+            self.e_min.insert(0, str(tmin_guess))
+        if tmax_guess is not None:
+            self.e_max.delete(0, tk.END)
+            self.e_max.insert(0, str(tmax_guess))
+
+        with self.state.lock:
+            self.state.image_path = path
+            self.state.img = img
+            self.state.need_reload_image = True
+            self.state.need_rebuild_lut = True
+
+    def on_apply(self):
+        try:
+            tmin = float(self.e_min.get().replace(",", "."))
+            tmax = float(self.e_max.get().replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Error", "Hibás Tmin/Tmax érték.")
+            return
+
+        with self.state.lock:
+            self.state.tmin = tmin
+            self.state.tmax = tmax
+            self.state.top_is_hot = self.var_top_hot.get()
+            self.state.need_rebuild_lut = True
 # ----------------------------
 # Main
 # ----------------------------
 
 def main():
+    DISPLAY_SCALE = 3
 
-    DISPLAY_SCALE = 3  # 2 vagy 3 ajánlott 320x240-hez
-    HUD_FONT = cv2.FONT_HERSHEY_SIMPLEX
-    HUD_SCALE = 0.3  # betűméret (kicsi)
-    HUD_THICK = 1  # vékony
-    HUD_PAD = 6  # belső margó
-    HUD_BG_ALPHA = 0.55  # félig átlátszó háttér
-
-
-    print("Thermal cursor estimator (PNG/JPG + scale).")
-    #path = input("Add meg a képfájl útvonalát (pl. C:\\kepek\\hokep.png): ").strip().strip('"')
-    path = r"c:\A\IMG_0045.bmp"
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        print("Nem tudtam beolvasni a képet. Ellenőrizd az útvonalat!")
-        return
-
-    # 1) Select scale ROI
-    # print("\n1) Jelöld ki a SZÍNSKÁLA téglalapját (egérrel), majd ENTER. ESC = kilép.")
-    # roi = cv2.selectROI("Select SCALE ROI", img, showCrosshair=True, fromCenter=False)
-    # cv2.destroyWindow("Select SCALE ROI")
-    #
-    # if roi == (0, 0, 0, 0):
-    #     print("ROI nincs kijelölve, kilépek.")
-    #     return
-    #
-    # # 2) Tmin / Tmax
-    # while True:
-    #     try:
-    #         t_min = float(input("2) Tmin (a skála legalja / legalacsonyabb érték, °C): ").replace(",", "."))
-    #         t_max = float(input("   Tmax (a skála teteje / legmagasabb érték, °C): ").replace(",", "."))
-    #         break
-    #     except ValueError:
-    #         print("Kérlek számot adj meg (pl. 18.5).")
-    #
-    # # 3) Orientation info
-    # ans = input("3) A skála TETEJE a melegebb (hot)? [y/n] (ha vízszintes skála: BAL oldala hot): ").strip().lower()
-    # top_is_hot = (ans != "n")
-
-    def crop_roi(img, roi):
-        x, y, w, h = roi
-        return img[y:y + h, x:x + w].copy()
-
-    # 1) FIX ROI használata
-    roi = SCALE_ROI
-    top_is_hot = TOP_IS_HOT
-
-    # 2) Template-ek betöltése
     templates = load_templates("templates")
-    print("TEMPLATE KEYS:", sorted(templates.keys()))
-    print("TEMPLATE COUNT:", len(templates))
-    if not templates:
-        print("Nincs templates mappa vagy üres. Kézzel kell Tmin/Tmax.")
-        t_min = float(input("Tmin (°C): ").replace(",", "."))
-        t_max = float(input("Tmax (°C): ").replace(",", "."))
-    else:
-        print("=== TMAX ===")
-        t_max = read_number_from_roi(crop_roi(img, TMAX_ROI), templates, min_score=0.40)
-        print("=== TMIN ===")
-        t_min = read_number_from_roi(crop_roi(img, TMIN_ROI), templates, min_score=0.40)
+    state = AppState()
 
-        dump_ocr_debug(img, TMAX_ROI, templates, name="TMAX")
-        dump_ocr_debug(img, TMIN_ROI, templates, name="TMIN")
-        print("Debug képek mentve: ./ocr_debug mappába")
+    # Tk root + panel
+    root = tk.Tk()
+    root.withdraw()
+    panel = ControlPanel(root, state, templates)
 
-        if t_min is None or t_max is None:
-            print("Template OCR nem sikerült biztosan. Fallback kézi beírás.")
-            #t_min = float(input("Tmin (°C): ").replace(",", "."))
-            t_min=float("-4.8")
-            #t_max = float(input("Tmax (°C): ").replace(",", "."))
-            t_max=float("2.8")
-
-        else:
-            print(f"Auto Tmin/Tmax: Tmin={t_min}, Tmax={t_max}")
-
-    # Build LUT
-    lut_colors, lut_temps = build_lut_from_scale(img, roi, t_min, t_max, top_is_hot=top_is_hot, samples=256)
-    print(f"LUT elkészült: {len(lut_temps)} mintapont a skáláról.")
-    scale_lab, scale_s, scale_t = build_parametric_scale(lut_colors, lut_temps)
-    # debug_scale_sampling(img, roi, out_prefix="scalecheck")
-
-    # Interactive window
     win = "Thermal Cursor (ESC=quit)"
-    display = img.copy()
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    last_xy = None
-    pinned_points = []  # list of (x,y,temp)
+    last_xy = {"x": None, "y": None}
 
     def on_mouse(event, x, y, flags, param):
-        nonlocal last_xy, pinned_points
-        # map display coords -> original coords
-        ox = int(x / DISPLAY_SCALE)
-        oy = int(y / DISPLAY_SCALE)
+        ox = x // DISPLAY_SCALE
+        oy = y // DISPLAY_SCALE
+        last_xy["x"], last_xy["y"] = ox, oy
 
-        if event == cv2.EVENT_MOUSEMOVE:
-            last_xy = (ox, oy)
-        elif event == cv2.EVENT_LBUTTONDOWN:
-            if 0 <= ox < img.shape[1] and 0 <= oy < img.shape[0]:
-                bgr = img[oy, ox].tolist()
-                temp, d2 = estimate_temp_projected(bgr, scale_lab, scale_s, scale_t)
-                pinned_points.append((ox, oy, temp))
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            pinned_points = []
+    cv2.setMouseCallback(win, on_mouse)
 
-    #cv2.namedWindow(win, cv2.WINDOW_NORMAL) #vissza
-    #cv2.setMouseCallback(win, on_mouse)
+    def tick():
+        with state.lock:
+            img = state.img
+            tmin = state.tmin
+            tmax = state.tmax
+            rebuild = state.need_rebuild_lut
 
-    print("\nKezdheted: mozgasd a kurzort a képen. Bal klikk = pont rögzítése, jobb klikk = pontok törlése, ESC = kilép.\n")
+        if img is not None and rebuild and tmin is not None and tmax is not None:
+            lut_colors, lut_temps = build_lut_from_scale(
+                img, SCALE_ROI, tmin, tmax,
+                top_is_hot=state.top_is_hot
+            )
+            scale_lab, scale_s, scale_t = build_parametric_scale(lut_colors, lut_temps)
+            with state.lock:
+                state.scale_lab = scale_lab
+                state.scale_s = scale_s
+                state.scale_t = scale_t
+                state.need_rebuild_lut = False
 
-    # dbg = draw_rois_debug(img)
-    # cv2.imshow("ROI check", dbg)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
+        if img is None:
+            display = np.zeros((240, 320, 3), np.uint8)
+            draw_hud(display, ["Select image in control panel"], origin=(6,6))
+        else:
+            display = img.copy()
+            with state.lock:
+                scale_lab = state.scale_lab
+                scale_s = state.scale_s
+                scale_t = state.scale_t
 
-    while True:
-        display = img.copy()
+            if scale_lab is not None and last_xy["x"] is not None:
+                x,y = last_xy["x"], last_xy["y"]
+                if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+                    temp,_ = estimate_temp_projected(
+                        img[y,x].tolist(),
+                        scale_lab, scale_s, scale_t
+                    )
+                    draw_hud(display, [f"XY: {x},{y}", f"T: {temp:.2f} C"])
 
-        # draw selected ROI for scale
-        # sx, sy, sw, sh = roi
-        # cv2.rectangle(display, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
-        # cv2.putText(display, "SCALE ROI", (sx, max(20, sy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        view = scale_for_display(display, DISPLAY_SCALE)
+        cv2.imshow(win, view)
 
-        # show current cursor temp
-        # draw pinned points
-        for (px, py, pt) in pinned_points:
-            cv2.circle(display, (px, py), 1, (0, 0, 0), -1)
-            cv2.circle(display, (px, py), 1, (0, 255, 255), -1)
-            cv2.putText(display, f"{pt:.2f}C", (px + 8, py - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3)
-            cv2.putText(display, f"{pt:.2f}C", (px + 8, py - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        if cv2.waitKey(1) == 27:
+            cv2.destroyAllWindows()
+            root.destroy()
+            return
 
-        # cv2.imshow(win, display)
-        lines = []
-        if last_xy is not None:
-            x, y = last_xy
-            if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
-                bgr = img[y, x].tolist()
-                temp, d2 = estimate_temp_projected(bgr, scale_lab, scale_s, scale_t)
-                lines.append(f"XY: {x},{y}")
-                lines.append(f"T:  {temp:.2f} C")
+        root.after(30, tick)
 
-        if len(pinned_points) > 0:
-            lines.append(f"Pins: {len(pinned_points)} (RMB clear)")
+    root.after(0, tick)
+    root.mainloop()
 
-        if not lines:
-            lines = ["Move mouse to read temperature", "LMB pin, RMB clear, ESC quit"]
-
-        draw_hud(display, lines, origin=(6, 6),
-                 font=HUD_FONT, font_scale=HUD_SCALE, thickness=HUD_THICK,
-                 pad=HUD_PAD, bg_alpha=HUD_BG_ALPHA)
-
-        # finally show scaled-up view
-        # view = scale_for_display(display, scale=DISPLAY_SCALE, interpolation=cv2.INTER_NEAREST)
-        # cv2.imshow(win, view)
-
-        break
-        key = cv2.waitKey(15) & 0xFF
-        if key == 27:  # ESC
-            break
-
-    cv2.destroyAllWindows()
 
 
 def dump_ocr_debug(img_bgr, roi, templates, name="TMAX", out_dir="ocr_debug", min_score=0.60):

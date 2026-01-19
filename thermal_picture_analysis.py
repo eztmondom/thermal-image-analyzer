@@ -481,6 +481,8 @@ class AppState:
         self.scale_lab = None
         self.scale_s = None
         self.scale_t = None
+        self.scale_ready = False
+        self.scale_for_path = None  # melyik képfájlhoz tartozik a jelenlegi LUT
 
 
 
@@ -556,18 +558,30 @@ class ControlPanel(tk.Toplevel):
             self.state.img = img
             self.state.need_reload_image = True
 
+            # --- INVALDIATE: új kép → régi LUT és "ready" kukázása ---
+            self.state.scale_lab = None
+            self.state.scale_s = None
+            self.state.scale_t = None
+            self.state.scale_ready = False
+            self.state.scale_for_path = None
+
             # >>> AUTO-APPLY: ha van tipp, rögtön érvényesítjük <<<
             self.state.tmin = tmin_guess
             self.state.tmax = tmax_guess
             self.state.top_is_hot = self.var_top_hot.get()
 
             # LUT csak akkor épüljön, ha mindkettő megvan
-            self.state.need_rebuild_lut = (tmin_guess is not None and tmax_guess is not None)
+            # self.state.need_rebuild_lut = (tmin_guess is not None and tmax_guess is not None)
 
-        # opcionális: ha mindkettő megvan, azonnal fusson le ugyanaz a validálás,
-        # mint Apply esetén (ha szeretnéd, hogy tmin>tmax-ra figyelmeztessen):
-        if tmin_guess is not None and tmax_guess is not None:
-            self.on_apply()
+            if tmin_guess is None:
+                self.e_min.delete(0, tk.END)
+            if tmax_guess is None:
+                self.e_max.delete(0, tk.END)
+
+            if tmin_guess is not None and tmax_guess is not None:
+                self.state.need_rebuild_lut = True
+            else:
+                self.state.need_rebuild_lut = False
 
     def on_apply(self):
         try:
@@ -623,10 +637,10 @@ def main():
             )
             scale_lab, scale_s, scale_t = build_parametric_scale(lut_colors, lut_temps)
             with state.lock:
-                state.scale_lab = scale_lab
-                state.scale_s = scale_s
-                state.scale_t = scale_t
+                state.scale_lab, state.scale_s, state.scale_t = scale_lab, scale_s, scale_t
                 state.need_rebuild_lut = False
+                state.scale_ready = True
+                state.scale_for_path = state.image_path
 
         if img is None:
             display = np.zeros((240, 320, 3), np.uint8)
@@ -634,13 +648,25 @@ def main():
         else:
             display = img.copy()
             with state.lock:
+                scale_ready = state.scale_ready
                 scale_lab = state.scale_lab
                 scale_s = state.scale_s
                 scale_t = state.scale_t
+                scale_for_path = state.scale_for_path
+                cur_path = state.image_path
+                tmin = state.tmin
+                tmax = state.tmax
 
-            if scale_lab is not None and last_xy["x"] is not None:
-                x,y = last_xy["x"], last_xy["y"]
-                if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+            lines = []
+            lines.append(f"Tmin={tmin}  Tmax={tmax}")
+
+            if (not scale_ready) or (scale_lab is None) or (scale_s is None) or (scale_t is None) or (
+                    scale_for_path != cur_path):
+                lines.append("Scale not ready: Tmin/Tmax ellenőrzés (panelen) → Apply")
+                draw_hud(display, lines, origin=(6, 6))
+            else:
+                x, y = last_xy["x"], last_xy["y"]
+                if x is not None and y is not None and 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
                     temp,_ = estimate_temp_projected(
                         img[y,x].tolist(),
                         scale_lab, scale_s, scale_t

@@ -606,13 +606,14 @@ class ControlPanel(tk.Toplevel):
         self.e_regex.insert(0, r".*")
 
         # ---- Tmin / Tmax ----
-        tk.Label(frm, text="Tmin (°C):").grid(row=2, column=0, sticky="e", pady=4)
-        self.e_min = tk.Entry(frm, width=12)
-        self.e_min.grid(row=2, column=1, sticky="w")
-
-        tk.Label(frm, text="Tmax (°C):").grid(row=3, column=0, sticky="e", pady=4)
+        tk.Label(frm, text="Tmax (°C):").grid(row=2, column=0, sticky="e", pady=4)
         self.e_max = tk.Entry(frm, width=12)
-        self.e_max.grid(row=3, column=1, sticky="w")
+        self.e_max.grid(row=2, column=1, sticky="w")
+
+        tk.Label(frm, text="Tmin (°C):").grid(row=3, column=0, sticky="e", pady=4)
+        self.e_min = tk.Entry(frm, width=12)
+        self.e_min.grid(row=3, column=1, sticky="w")
+
 
         self.var_top_hot = tk.BooleanVar(value=TOP_IS_HOT)
         tk.Checkbutton(frm, text="Top is hot", variable=self.var_top_hot)\
@@ -815,7 +816,7 @@ def main():
         view = scale_for_display(display, DISPLAY_SCALE)
         cv2.imshow(win, view)
 
-        key = cv2.waitKeyEx(1)
+        key = cv2.waitKeyEx(50)
 
         # ESC
         if key == 27:
@@ -824,20 +825,15 @@ def main():
             root.destroy()
             return
 
-        # LEFT / RIGHT (OpenCV platformfüggő kódok)
         LEFT_KEYS = {81, 2424832, 0x250000}
         RIGHT_KEYS = {83, 2555904, 0x270000}
 
         if key in LEFT_KEYS:
-            print("left")
             navigate_relative(state, -1, templates, panel=panel)
-
         elif key in RIGHT_KEYS:
-            print("right")
             navigate_relative(state, +1, templates, panel=panel)
 
-
-        root.after(30, tick)
+        root.after(1, tick)
 
     root.after(0, tick)
     root.mainloop()

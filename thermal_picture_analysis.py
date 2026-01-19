@@ -5,11 +5,105 @@ import os
 import threading
 from tkinter import filedialog, messagebox
 import tkinter as tk
+import re
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
+
+def load_image_into_state(state, path, templates, panel=None):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        return False
+
+    def crop(im, roi):
+        x,y,w,h = roi
+        return im[y:y+h, x:x+w]
+
+    tmax_guess = read_number_from_roi(crop(img, TMAX_ROI), templates, min_score=0.45) if templates else None
+    tmin_guess = read_number_from_roi(crop(img, TMIN_ROI), templates, min_score=0.45) if templates else None
+
+    with state.lock:
+        state.image_path = path
+        state.img = img
+
+        # invalidate LUT
+        state.scale_lab = None
+        state.scale_s = None
+        state.scale_t = None
+        state.scale_ready = False
+        state.scale_for_path = None
+
+        # auto-apply OCR tipp
+        state.tmin = tmin_guess
+        state.tmax = tmax_guess
+        state.need_rebuild_lut = (tmin_guess is not None and tmax_guess is not None)
+
+    # panel mezők frissítése (ha megadtuk)
+    if panel is not None:
+        panel.e_path.delete(0, tk.END)
+        panel.e_path.insert(0, path)
+        if tmin_guess is not None:
+            panel.e_min.delete(0, tk.END)
+            panel.e_min.insert(0, str(tmin_guess))
+        if tmax_guess is not None:
+            panel.e_max.delete(0, tk.END)
+            panel.e_max.insert(0, str(tmax_guess))
+
+    return True
+
+def navigate_relative(state, delta, templates, panel=None):
+    with state.lock:
+        print("NAV: idx", state.file_index, "len", len(state.file_list), "path", state.image_path)
+        files = list(state.file_list)
+        idx = state.file_index
+
+    if not files or idx < 0:
+        return False
+
+
+    n = len(files)
+    new_idx = (idx + delta) % n
+
+    # print("NAV: new_idx", new_idx)
+    new_path = files[new_idx]
+    # print("NAV: new_path", new_path)
+    ok = load_image_into_state(state, new_path, templates, panel=panel)
+    if ok:
+        with state.lock:
+            state.file_index = new_idx
+    return ok
+
+
+def build_file_list_for_path(path, regex_pattern=r".*"):
+    folder = os.path.dirname(path)
+    try:
+        rx = re.compile(regex_pattern)
+    except re.error:
+        rx = re.compile(r".*")  # rossz regex -> fallback
+
+    files = []
+    for fn in sorted(os.listdir(folder)):
+        full = os.path.join(folder, fn)
+        if not os.path.isfile(full):
+            continue
+        if rx.search(fn):
+            files.append(full)
+    print("FILTER regex:", regex_pattern, "->", len(files), "files")
+    print("SAMPLE:", [os.path.basename(p) for p in files[:5]])
+    return folder, files
+
+def norm_path(p: str) -> str:
+    # abszolút + normcase (Windows: kis/nagybetű egységes) + normpath (slash/backslash)
+    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+def find_index(files, path):
+    target = norm_path(path)
+    for i, f in enumerate(files):
+        if norm_path(f) == target:
+            return i
+    return -1
 
 def normalize_glyph(bw, size=(32, 32), pad=3):
     """
@@ -69,9 +163,6 @@ def draw_rois_debug(img_bgr):
     return out
 
 def preprocess_digit_crop(bgr, name="defname"):
-    import cv2
-    import numpy as np
-
     # 1) upscale (OCR-nek és szegmentálásnak sokat számít)
     img = cv2.resize(bgr, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC)
 
@@ -330,9 +421,6 @@ def debug_scale_sampling(img_bgr, roi, sample_x=None, samples=256, out_prefix="d
     plt.show()
     
 def build_parametric_scale(lut_colors_bgr, lut_temps):
-    import cv2
-    import numpy as np
-
     lab = cv2.cvtColor(
         lut_colors_bgr.reshape(-1,1,3).astype(np.uint8),
         cv2.COLOR_BGR2LAB
@@ -447,9 +535,6 @@ def build_lut_from_scale(image_bgr, roi, t_min, t_max, top_is_hot=True, samples=
 
 
 def estimate_temp_projected(bgr, scale_lab, scale_s, scale_t):
-    import cv2
-    import numpy as np
-
     pix_lab = cv2.cvtColor(
         np.array([[bgr]], dtype=np.uint8),
         cv2.COLOR_BGR2LAB
@@ -484,9 +569,19 @@ class AppState:
         self.scale_ready = False
         self.scale_for_path = None  # melyik képfájlhoz tartozik a jelenlegi LUT
 
+        self.file_regex = r".*"      # default: mindent enged
+        self.file_list = []          # abszolút útvonalak
+        self.file_index = -1         # aktuális index a file_list-ben
+        self.pending_nav = 0         # -1 / +1 (tick-ben feldolgozzuk)
 
 
 class ControlPanel(tk.Toplevel):
+    def on_prev(self):
+        navigate_relative(self.state, -1, self.templates, panel=self)
+
+    def on_next(self):
+        navigate_relative(self.state, +1, self.templates, panel=self)
+
     def __init__(self, master, state: AppState, templates):
         super().__init__(master)
         self.state = state
@@ -505,22 +600,29 @@ class ControlPanel(tk.Toplevel):
         self.e_path.grid(row=0, column=1)
         tk.Button(frm, text="Browse…", command=self.on_browse).grid(row=0, column=2, padx=6)
 
-        # ---- Tmin / Tmax ----
-        tk.Label(frm, text="Tmin (°C):").grid(row=1, column=0, sticky="e", pady=4)
-        self.e_min = tk.Entry(frm, width=12)
-        self.e_min.grid(row=1, column=1, sticky="w")
+        tk.Label(frm, text="Filter (regex):").grid(row=1, column=0, sticky="e", pady=4)
+        self.e_regex = tk.Entry(frm, width=45)
+        self.e_regex.grid(row=1, column=1, columnspan=2, sticky="w")
+        self.e_regex.insert(0, r".*")
 
-        tk.Label(frm, text="Tmax (°C):").grid(row=2, column=0, sticky="e", pady=4)
+        # ---- Tmin / Tmax ----
+        tk.Label(frm, text="Tmin (°C):").grid(row=2, column=0, sticky="e", pady=4)
+        self.e_min = tk.Entry(frm, width=12)
+        self.e_min.grid(row=2, column=1, sticky="w")
+
+        tk.Label(frm, text="Tmax (°C):").grid(row=3, column=0, sticky="e", pady=4)
         self.e_max = tk.Entry(frm, width=12)
-        self.e_max.grid(row=2, column=1, sticky="w")
+        self.e_max.grid(row=3, column=1, sticky="w")
 
         self.var_top_hot = tk.BooleanVar(value=TOP_IS_HOT)
         tk.Checkbutton(frm, text="Top is hot", variable=self.var_top_hot)\
-            .grid(row=3, column=0, columnspan=3, sticky="w", pady=6)
+            .grid(row=4, column=0, columnspan=3, sticky="w", pady=6)
 
         btns = tk.Frame(frm)
-        btns.grid(row=4, column=0, columnspan=3, sticky="e")
+        btns.grid(row=5, column=0, columnspan=3, sticky="e")
 
+        tk.Button(btns, text="Prev", width=10, command=self.on_prev).pack(side="left")
+        tk.Button(btns, text="Next", width=10, command=self.on_next).pack(side="left", padx=(6, 12))
         tk.Button(btns, text="Apply", width=10, command=self.on_apply).pack(side="right")
         tk.Button(btns, text="Close", width=10, command=self.destroy).pack(side="right", padx=6)
 
@@ -535,6 +637,13 @@ class ControlPanel(tk.Toplevel):
         if img is None:
             messagebox.showerror("Error", "Nem sikerült betölteni a képet.")
             return
+
+        regex = self.e_regex.get().strip()
+        if regex == "":
+            regex = r".*"
+
+        folder, files = build_file_list_for_path(path, regex)
+        idx = find_index(files, path)
 
         # OCR tipp
         def crop(img, roi):
@@ -558,6 +667,10 @@ class ControlPanel(tk.Toplevel):
             self.state.img = img
             self.state.need_reload_image = True
 
+            self.state.file_regex = regex
+            self.state.file_list = files
+            self.state.file_index = idx
+
             # --- INVALDIATE: új kép → régi LUT és "ready" kukázása ---
             self.state.scale_lab = None
             self.state.scale_s = None
@@ -571,7 +684,7 @@ class ControlPanel(tk.Toplevel):
             self.state.top_is_hot = self.var_top_hot.get()
 
             # LUT csak akkor épüljön, ha mindkettő megvan
-            # self.state.need_rebuild_lut = (tmin_guess is not None and tmax_guess is not None)
+            self.state.need_rebuild_lut = (tmin_guess is not None and tmax_guess is not None)
 
             if tmin_guess is None:
                 self.e_min.delete(0, tk.END)
@@ -584,6 +697,13 @@ class ControlPanel(tk.Toplevel):
                 self.state.need_rebuild_lut = False
 
     def on_apply(self):
+        path = self.e_path.get().strip().strip('"')
+
+        regex = self.e_regex.get().strip()
+        if regex == "":
+            regex = r".*"
+
+        # Tmin/Tmax parse
         try:
             tmin = float(self.e_min.get().replace(",", "."))
             tmax = float(self.e_max.get().replace(",", "."))
@@ -591,6 +711,25 @@ class ControlPanel(tk.Toplevel):
             messagebox.showerror("Error", "Hibás Tmin/Tmax érték.")
             return
 
+        # ha van path, akkor Apply-re frissítsük a file_list-et is
+        if path != "" and os.path.isfile(path):
+            folder, files = build_file_list_for_path(path, regex)
+            idx = find_index(files, path)
+
+            # ha a regex miatt az aktuális fájl kiesett, válasszuk az elsőt (jobb UX)
+            if idx < 0 and files:
+                idx = 0
+                path = files[0]
+                self.e_path.delete(0, tk.END)
+                self.e_path.insert(0, path)
+                load_image_into_state(self.state, path, self.templates, panel=self)
+
+            with self.state.lock:
+                self.state.file_regex = regex
+                self.state.file_list = files
+                self.state.file_index = idx
+
+        # állítsuk a scale-t és rebuild-et
         with self.state.lock:
             self.state.tmin = tmin
             self.state.tmax = tmax
@@ -676,10 +815,27 @@ def main():
         view = scale_for_display(display, DISPLAY_SCALE)
         cv2.imshow(win, view)
 
-        if cv2.waitKey(1) == 27:
+        key = cv2.waitKeyEx(1)
+
+        # ESC
+        if key == 27:
+            print("ESC pressed")
             cv2.destroyAllWindows()
             root.destroy()
             return
+
+        # LEFT / RIGHT (OpenCV platformfüggő kódok)
+        LEFT_KEYS = {81, 2424832, 0x250000}
+        RIGHT_KEYS = {83, 2555904, 0x270000}
+
+        if key in LEFT_KEYS:
+            print("left")
+            navigate_relative(state, -1, templates, panel=panel)
+
+        elif key in RIGHT_KEYS:
+            print("right")
+            navigate_relative(state, +1, templates, panel=panel)
+
 
         root.after(30, tick)
 

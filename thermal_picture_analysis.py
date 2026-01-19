@@ -555,7 +555,19 @@ class ControlPanel(tk.Toplevel):
             self.state.image_path = path
             self.state.img = img
             self.state.need_reload_image = True
-            self.state.need_rebuild_lut = True
+
+            # >>> AUTO-APPLY: ha van tipp, rögtön érvényesítjük <<<
+            self.state.tmin = tmin_guess
+            self.state.tmax = tmax_guess
+            self.state.top_is_hot = self.var_top_hot.get()
+
+            # LUT csak akkor épüljön, ha mindkettő megvan
+            self.state.need_rebuild_lut = (tmin_guess is not None and tmax_guess is not None)
+
+        # opcionális: ha mindkettő megvan, azonnal fusson le ugyanaz a validálás,
+        # mint Apply esetén (ha szeretnéd, hogy tmin>tmax-ra figyelmeztessen):
+        if tmin_guess is not None and tmax_guess is not None:
+            self.on_apply()
 
     def on_apply(self):
         try:
